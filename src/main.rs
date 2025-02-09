@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use arboard::Clipboard;
 use crossterm::{
     cursor,
     event::{self, Event, KeyModifiers},
@@ -12,6 +13,8 @@ use crossterm::{
     terminal::{self, disable_raw_mode, enable_raw_mode},
     ExecutableCommand, QueueableCommand,
 };
+
+use unicode_segmentation::UnicodeSegmentation;
 
 struct CursorPos {
     /// 0 is the top most row
@@ -22,9 +25,11 @@ struct CursorPos {
 enum Mode {
     Normal,
     Insert,
+    Y,
+    D,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Tags(HashMap<String, String>);
 
 impl Tags {
@@ -101,6 +106,19 @@ struct Privmsg {
     message: String,
 }
 
+impl Privmsg {
+    fn message_line_len(&self) -> usize {
+        self.message.graphemes(true).count()
+            + self
+                .tags
+                .get("display-name")
+                .unwrap_or(self.prefix.user.as_ref().unwrap_or(&self.channel))
+                .graphemes(true)
+                .count()
+            + 2
+    }
+}
+
 #[derive(Debug)]
 struct IRCMessage {
     tags: Tags,
@@ -127,6 +145,7 @@ impl IRCMessage {
 #[derive(Debug)]
 enum IRCCommand {
     Privmsg { channel: String, message: String },
+    GlobalUserState,
     Unknown(String),
 }
 
@@ -147,6 +166,10 @@ impl IRCCommand {
             });
         }
 
+        if let Some(_) = raw_message[*pos..].strip_prefix("GLOBALUSERSTATE") {
+            return Some(IRCCommand::GlobalUserState);
+        }
+
         Some(IRCCommand::Unknown(
             raw_message[*pos..raw_message.len()].to_string(),
         ))
@@ -157,10 +180,12 @@ struct IRC {
     irc_message_receiver: crossbeam::channel::Receiver<IRCMessage>,
     auth_token: String,
     message_sender: crossbeam::channel::Sender<String>,
+    channel: String,
+    nick: String,
 }
 
 impl IRC {
-    fn new(address: &str, auth_token: &str, nick: &str) -> anyhow::Result<Self> {
+    fn new(address: &str, auth_token: &str, nick: &str, channel: &str) -> anyhow::Result<Self> {
         let mut connection = TcpStream::connect(address)?;
 
         connection
@@ -183,7 +208,7 @@ impl IRC {
 
         connection.write_all(format!("NICK {}\r\n", nick).as_bytes())?;
 
-        connection.write_all(b"JOIN #sadmadladsalman\r\n")?;
+        connection.write_all(format!("JOIN #{channel}\r\n").as_bytes())?;
 
         let (message_sender, message_receiver) = crossbeam::channel::unbounded::<String>();
 
@@ -220,6 +245,8 @@ impl IRC {
             irc_message_receiver,
             auth_token: auth_token.to_string(),
             message_sender,
+            channel: channel.to_string(),
+            nick: nick.to_string(),
         })
     }
 
@@ -254,25 +281,43 @@ fn main() {
         column: 0,
     };
 
-    let mut chat_lines: Vec<Privmsg> = Vec::new();
+    let mut chat_messages: Vec<Privmsg> = Vec::new();
 
     let mut edit_mode = Mode::Normal;
     stdout.execute(cursor::SetCursorStyle::SteadyBlock).unwrap();
+    stdout
+        .execute(event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        ))
+        .unwrap();
 
     let mut send_message = String::new();
 
-    let mut irc = IRC::new("irc.chat.twitch.tv:6667", &auth_token, "sadmadٍٍladsalman").unwrap();
+    let mut irc = IRC::new(
+        "irc.chat.twitch.tv:6667",
+        &auth_token,
+        "sadmadٍٍladsalman",
+        "sadmadٍٍladsalman",
+    )
+    .unwrap();
+
+    let mut user_tags = None;
+
+    let mut clipboard = Clipboard::new().unwrap();
 
     loop {
         while let Ok(irc_message) = irc.try_recv() {
             match irc_message.command {
                 IRCCommand::Privmsg { channel, message } => {
-                    chat_lines.push(Privmsg {
+                    chat_messages.push(Privmsg {
                         tags: irc_message.tags,
                         prefix: irc_message.prefix,
                         channel,
                         message,
                     });
+                }
+                IRCCommand::GlobalUserState => {
+                    user_tags = Some(irc_message.tags);
                 }
                 _ => {}
             }
@@ -284,16 +329,19 @@ fn main() {
             &mut stdout,
             &cursor_pos,
             &edit_mode,
-            &chat_lines,
+            &chat_messages,
             &send_message,
             total_rows,
         )
         .unwrap();
 
         if event::poll(Duration::from_millis(16)).unwrap() {
-            let first_message_pos = total_rows
-                .saturating_sub(chat_lines.len() as u16)
+            let messages_lines_start_pos = total_rows
+                .saturating_sub(chat_messages.len() as u16)
                 .saturating_sub(1);
+
+            let current_line = &chat_messages
+                .get((cursor_pos.row - messages_lines_start_pos).saturating_sub(1) as usize);
 
             match event::read().expect("failed to read event") {
                 Event::Key(key_event) => match key_event.code {
@@ -303,9 +351,25 @@ fn main() {
                     }
 
                     event::KeyCode::Enter if matches!(edit_mode, Mode::Insert) => {
-                        irc.send_message(&send_message).unwrap();
-                        send_message.clear();
-                        cursor_pos.column = 0;
+                        if !send_message.is_empty() {
+                            if irc.send_message(&send_message).is_ok() {
+                                chat_messages.push(Privmsg {
+                                    tags: user_tags.as_ref().cloned().unwrap_or_default(),
+                                    prefix: Prefix {
+                                        nick: Some(irc.nick.clone()),
+                                        user: Some(irc.nick.clone()),
+                                        host: String::from("idk"),
+                                    },
+                                    channel: irc.channel.clone(),
+                                    message: send_message.clone(),
+                                });
+
+                                if !key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                                    send_message.clear();
+                                    cursor_pos.column = 0;
+                                }
+                            }
+                        }
                     }
 
                     event::KeyCode::Backspace if matches!(edit_mode, Mode::Insert) => {
@@ -335,24 +399,25 @@ fn main() {
                         'q' if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
                             break;
                         }
+                        'c' if key_event.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
 
                         'i' if matches!(edit_mode, Mode::Normal) => {
                             edit_mode = Mode::Insert;
-                            stdout.queue(cursor::SetCursorStyle::SteadyBar).unwrap();
-                            stdout
-                                .queue(cursor::MoveTo(total_columns, total_rows))
-                                .unwrap();
-                            stdout.flush().unwrap();
+                            stdout.execute(cursor::SetCursorStyle::SteadyBar).unwrap();
+                            cursor_pos.row = total_rows.saturating_sub(1);
+                            cursor_pos.column = send_message.graphemes(true).count() as u16;
                         }
 
                         'h' if matches!(edit_mode, Mode::Normal) => {
-                            if cursor_pos.row == total_rows {
+                            if cursor_pos.row == total_rows - 1 {
                                 cursor_pos.column = cursor_pos.column.saturating_sub(1);
                             } else {
                                 if let Some(new_pos) = cursor_pos.column.checked_sub(1) {
                                     cursor_pos.column = new_pos;
                                 } else {
-                                    if first_message_pos > cursor_pos.row {
+                                    if messages_lines_start_pos > cursor_pos.row {
                                         // TODO: Handle going to previous line
                                         cursor_pos.row = cursor_pos.row.saturating_sub(1);
                                         // cursor_pos.column = cursor_pos.column.max(
@@ -365,17 +430,19 @@ fn main() {
                             }
                         }
                         'j' if matches!(edit_mode, Mode::Normal) => {
-                            cursor_pos.row += 1;
+                            cursor_pos.row = (total_rows - 1).min(cursor_pos.row + 1);
                             // cursor_pos.column = cursor_pos.column.min(
                             //     chat_lines[chat_lines.len() - cursor_pos.row as usize]
                             //         .message
                             //         .len() as u16,
                             // )
+                            println!("j:{total_rows} > {}", cursor_pos.row);
                         }
                         'k' if matches!(edit_mode, Mode::Normal) => {
                             let messages_start =
-                                chat_lines.len().saturating_sub(total_rows as usize);
-                            if first_message_pos < cursor_pos.row && chat_lines.len() > 0 {
+                                chat_messages.len().saturating_sub(total_rows as usize);
+                            if messages_lines_start_pos < cursor_pos.row && chat_messages.len() > 0
+                            {
                                 if let Some(new_pos) = cursor_pos.row.checked_sub(1) {
                                     cursor_pos.row = new_pos;
 
@@ -385,6 +452,7 @@ fn main() {
                                     //         .len() as u16,
                                     // )
                                 }
+                                println!("k: {messages_lines_start_pos}: {}", cursor_pos.row);
                             }
                         }
                         'l' if matches!(edit_mode, Mode::Normal) => {
@@ -393,18 +461,76 @@ fn main() {
                                     cursor_pos.column += 1;
                                 }
                             } else {
-                                let current_line = &chat_lines[(cursor_pos.row - first_message_pos)
-                                    .saturating_sub(1)
-                                    as usize];
+                                let Some(current_line) = current_line else {
+                                    continue;
+                                };
+
                                 if current_line.message.len() + current_line.channel.len()
                                     <= cursor_pos.column as usize
-                                    && chat_lines.len() <= cursor_pos.row as usize
+                                    && chat_messages.len() <= cursor_pos.row as usize
                                 {
                                     cursor_pos.row += 1;
                                     cursor_pos.column = 0;
                                 } else {
                                     cursor_pos.column += 1;
                                 }
+                            }
+                        }
+
+                        '$' if matches!(edit_mode, Mode::Normal) => {
+                            let Some(current_line) = current_line else {
+                                continue;
+                            };
+                            cursor_pos.column = current_line.message_line_len() as u16;
+                        }
+
+                        '^' if matches!(edit_mode, Mode::Normal) => {
+                            cursor_pos.column = 0;
+                        }
+
+                        'y' if matches!(edit_mode, Mode::Normal) => {
+                            edit_mode = Mode::Y;
+                        }
+
+                        'd' if matches!(edit_mode, Mode::Normal) => {
+                            edit_mode = Mode::D;
+                        }
+
+                        c if matches!(edit_mode, Mode::Y) => {
+                            if c == 'y' {
+                                let Some(current_line) = current_line else {
+                                    edit_mode = Mode::Normal;
+                                    continue;
+                                };
+
+                                clipboard.set_text(&current_line.message).unwrap();
+                            }
+
+                            edit_mode = Mode::Normal;
+                        }
+
+                        c if matches!(edit_mode, Mode::D) => {
+                            if c == 'd' {
+                                if cursor_pos.row == total_rows - 1 {
+                                    clipboard.set_text(&send_message).unwrap();
+                                    send_message.clear();
+                                    cursor_pos.column = 0;
+                                }
+                            }
+
+                            edit_mode = Mode::Normal;
+                        }
+
+                        'P' if matches!(edit_mode, Mode::Normal) => {
+                            if let Ok(clipboard_text) = clipboard.get_text() {
+                                if cursor_pos.row != total_rows - 1 {
+                                    cursor_pos.row = total_rows - 1;
+                                    cursor_pos.column = send_message.graphemes(true).count() as u16;
+                                }
+
+                                send_message
+                                    .insert_str(cursor_pos.column as usize, &clipboard_text);
+                                cursor_pos.column += clipboard_text.graphemes(true).count() as u16;
                             }
                         }
 
@@ -447,7 +573,11 @@ fn draw(
     for (i, message) in chat_messages[messages_start..].iter().enumerate() {
         stdout.queue(style::Print(format!(
             "{}: {}",
-            message.channel, message.message
+            message
+                .tags
+                .get("display-name")
+                .unwrap_or(message.prefix.nick.as_ref().unwrap_or(&message.channel)),
+            message.message
         )))?;
         stdout.queue(cursor::MoveTo(0, first_message_pos + i as u16 + 1))?;
     }
