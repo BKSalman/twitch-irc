@@ -1,3 +1,4 @@
+use core::panic;
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Stdout, Write},
@@ -107,15 +108,18 @@ struct Privmsg {
 }
 
 impl Privmsg {
-    fn message_line_len(&self) -> usize {
-        self.message.graphemes(true).count()
-            + self
-                .tags
+    fn message_line(&self) -> String {
+        format!(
+            "{}: {}",
+            self.tags
                 .get("display-name")
-                .unwrap_or(self.prefix.user.as_ref().unwrap_or(&self.channel))
-                .graphemes(true)
-                .count()
-            + 2
+                .unwrap_or(self.prefix.user.as_ref().unwrap_or(&self.channel)),
+            self.message
+        )
+    }
+
+    fn message_line_len(&self) -> usize {
+        self.message_line().graphemes(true).count()
     }
 }
 
@@ -147,6 +151,8 @@ enum IRCCommand {
     Privmsg { channel: String, message: String },
     GlobalUserState,
     Unknown(String),
+    CapAck,
+    Ping,
 }
 
 impl IRCCommand {
@@ -170,6 +176,14 @@ impl IRCCommand {
             return Some(IRCCommand::GlobalUserState);
         }
 
+        if let Some(_) = raw_message[*pos..].strip_prefix("CAP * ACK") {
+            return Some(IRCCommand::CapAck);
+        }
+
+        if let Some(_) = raw_message[*pos..].strip_prefix("PING :tmi.twitch.tv\r\n") {
+            return Some(IRCCommand::Ping);
+        }
+
         Some(IRCCommand::Unknown(
             raw_message[*pos..raw_message.len()].to_string(),
         ))
@@ -186,29 +200,7 @@ struct IRC {
 
 impl IRC {
     fn new(address: &str, auth_token: &str, nick: &str, channel: &str) -> anyhow::Result<Self> {
-        let mut connection = TcpStream::connect(address)?;
-
-        connection
-            .write_all(b"CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n")?;
-
-        let mut buf_reader = BufReader::new(&mut connection);
-
-        let mut received = String::new();
-
-        buf_reader.read_line(&mut received)?;
-
-        if received
-            != ":tmi.twitch.tv CAP * ACK :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n"
-        {
-            eprintln!("{received:?}");
-            return Err(anyhow::anyhow!("no ack"));
-        }
-
-        connection.write_all(format!("PASS oauth:{}\r\n", auth_token).as_bytes())?;
-
-        connection.write_all(format!("NICK {}\r\n", nick).as_bytes())?;
-
-        connection.write_all(format!("JOIN #{channel}\r\n").as_bytes())?;
+        let connection = TcpStream::connect(address)?;
 
         let (message_sender, message_receiver) = crossbeam::channel::unbounded::<String>();
 
@@ -241,6 +233,29 @@ impl IRC {
             });
         }
 
+        message_sender.send(String::from(
+            "CAP REQ :twitch.tv/membership twitch.tv/tags twitch.tv/commands\r\n",
+        ))?;
+
+        let received = irc_message_receiver.recv_timeout(Duration::from_secs(5))?;
+        if !matches!(
+            received,
+            IRCMessage {
+                tags: _,
+                prefix: _,
+                command: IRCCommand::CapAck
+            },
+        ) {
+            eprintln!("{received:?}");
+            return Err(anyhow::anyhow!("no ack"));
+        }
+
+        message_sender.send(format!("PASS oauth:{}\r\n", auth_token))?;
+
+        message_sender.send(format!("NICK {}\r\n", nick))?;
+
+        message_sender.send(format!("JOIN #{channel}\r\n"))?;
+
         Ok(Self {
             irc_message_receiver,
             auth_token: auth_token.to_string(),
@@ -251,7 +266,7 @@ impl IRC {
     }
 
     fn send_message(&mut self, message: &str) -> anyhow::Result<()> {
-        let privmsg = format!("PRIVMSG #sadmadladsalman :{message}\r\n");
+        let privmsg = format!("PRIVMSG #{} :{message}\r\n", self.channel);
         self.message_sender.send(privmsg)?;
 
         Ok(())
@@ -263,7 +278,18 @@ impl IRC {
 }
 
 fn main() {
-    let auth_token = std::env::var("TWITCH_TOKEN").expect("should provide twitch auth token");
+    let args = std::env::args().collect::<Vec<String>>();
+
+    let (channel, auth_token) = match &args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [_cmd, "--token", token, "--channel", channel] => (channel.to_string(), token.to_string()),
+        [_cmd, "--channel", channel] => (
+            channel.to_string(),
+            std::env::var("TWITCH_TOKEN").expect("should provide twitch auth token"),
+        ),
+        _ => {
+            panic!("Should provide a channel name")
+        }
+    };
 
     let mut stdout = std::io::stdout();
 
@@ -296,8 +322,8 @@ fn main() {
     let mut irc = IRC::new(
         "irc.chat.twitch.tv:6667",
         &auth_token,
-        "sadmadٍٍladsalman",
-        "sadmadٍٍladsalman",
+        "sadmadladsalman",
+        &channel,
     )
     .unwrap();
 
@@ -340,8 +366,8 @@ fn main() {
                 .saturating_sub(chat_messages.len() as u16)
                 .saturating_sub(1);
 
-            let current_line = &chat_messages
-                .get((cursor_pos.row - messages_lines_start_pos).saturating_sub(1) as usize);
+            let current_message_index =
+                cursor_pos.row.saturating_sub(messages_lines_start_pos) as usize;
 
             match event::read().expect("failed to read event") {
                 Event::Key(key_event) => match key_event.code {
@@ -406,12 +432,14 @@ fn main() {
                         'i' if matches!(edit_mode, Mode::Normal) => {
                             edit_mode = Mode::Insert;
                             stdout.execute(cursor::SetCursorStyle::SteadyBar).unwrap();
-                            cursor_pos.row = total_rows.saturating_sub(1);
-                            cursor_pos.column = send_message.graphemes(true).count() as u16;
+                            if cursor_pos.row < total_rows - 1 {
+                                cursor_pos.row = total_rows.saturating_sub(1);
+                                cursor_pos.column = send_message.graphemes(true).count() as u16;
+                            }
                         }
 
                         'h' if matches!(edit_mode, Mode::Normal) => {
-                            if cursor_pos.row == total_rows - 1 {
+                            if cursor_pos.row >= total_rows - 1 {
                                 cursor_pos.column = cursor_pos.column.saturating_sub(1);
                             } else {
                                 if let Some(new_pos) = cursor_pos.column.checked_sub(1) {
@@ -431,16 +459,25 @@ fn main() {
                         }
                         'j' if matches!(edit_mode, Mode::Normal) => {
                             cursor_pos.row = (total_rows - 1).min(cursor_pos.row + 1);
-                            // cursor_pos.column = cursor_pos.column.min(
-                            //     chat_lines[chat_lines.len() - cursor_pos.row as usize]
-                            //         .message
-                            //         .len() as u16,
-                            // )
-                            println!("j:{total_rows} > {}", cursor_pos.row);
+
+                            if cursor_pos.row >= total_rows - 1 {
+                                cursor_pos.column = cursor_pos
+                                    .column
+                                    .min(send_message.graphemes(true).count() as u16);
+                            } else {
+                                let current_message = chat_messages
+                                    .get((cursor_pos.row - messages_lines_start_pos) as usize);
+
+                                let Some(current_message) = current_message else {
+                                    continue;
+                                };
+
+                                cursor_pos.column = cursor_pos
+                                    .column
+                                    .min(current_message.message_line_len() as u16);
+                            }
                         }
                         'k' if matches!(edit_mode, Mode::Normal) => {
-                            let messages_start =
-                                chat_messages.len().saturating_sub(total_rows as usize);
                             if messages_lines_start_pos < cursor_pos.row && chat_messages.len() > 0
                             {
                                 if let Some(new_pos) = cursor_pos.row.checked_sub(1) {
@@ -452,7 +489,7 @@ fn main() {
                                     //         .len() as u16,
                                     // )
                                 }
-                                println!("k: {messages_lines_start_pos}: {}", cursor_pos.row);
+                                // println!("k: {messages_lines_start_pos}: {}", cursor_pos.row);
                             }
                         }
                         'l' if matches!(edit_mode, Mode::Normal) => {
@@ -461,12 +498,13 @@ fn main() {
                                     cursor_pos.column += 1;
                                 }
                             } else {
-                                let Some(current_line) = current_line else {
+                                let Some(current_message) =
+                                    chat_messages.get(current_message_index)
+                                else {
                                     continue;
                                 };
 
-                                if current_line.message.len() + current_line.channel.len()
-                                    <= cursor_pos.column as usize
+                                if current_message.message_line_len() <= cursor_pos.column as usize
                                     && chat_messages.len() <= cursor_pos.row as usize
                                 {
                                     cursor_pos.row += 1;
@@ -477,11 +515,69 @@ fn main() {
                             }
                         }
 
+                        'b' if matches!(edit_mode, Mode::Normal) => {
+                            if cursor_pos.row >= total_rows - 1 {
+                                cursor_pos.column =
+                                    send_message[..cursor_pos.column.saturating_sub(1) as usize]
+                                        .rfind(' ')
+                                        .map(|i| i + 1)
+                                        .unwrap_or(0) as u16;
+                            } else {
+                                let Some(current_message) =
+                                    chat_messages.get(current_message_index)
+                                else {
+                                    continue;
+                                };
+
+                                cursor_pos.column = current_message.message_line()
+                                    [..cursor_pos.column.saturating_sub(1) as usize]
+                                    .rfind(' ')
+                                    .map(|i| i + 1)
+                                    .unwrap_or(0)
+                                    as u16;
+                            }
+                        }
+                        'w' if matches!(edit_mode, Mode::Normal) => {
+                            if cursor_pos.row >= total_rows - 1 {
+                                if let Some(send_message) =
+                                    send_message.get((cursor_pos.column + 1) as usize..)
+                                {
+                                    cursor_pos.column +=
+                                        send_message.find(' ').map(|i| i + 1).unwrap_or(
+                                            send_message
+                                                .graphemes(true)
+                                                .count()
+                                                .saturating_sub(cursor_pos.column as usize),
+                                        ) as u16;
+                                }
+                            } else {
+                                let Some(current_message) =
+                                    chat_messages.get(current_message_index)
+                                else {
+                                    continue;
+                                };
+
+                                if let Some(message) = current_message
+                                    .message_line()
+                                    .get((cursor_pos.column + 1) as usize..)
+                                {
+                                    cursor_pos.column += message.find(' ').map(|i| i + 1).unwrap_or(
+                                        current_message
+                                            .message_line_len()
+                                            .saturating_sub(cursor_pos.column as usize),
+                                    )
+                                        as u16;
+                                }
+                            }
+                        }
+
                         '$' if matches!(edit_mode, Mode::Normal) => {
-                            let Some(current_line) = current_line else {
+                            let Some(current_message) = chat_messages.get(current_message_index)
+                            else {
                                 continue;
                             };
-                            cursor_pos.column = current_line.message_line_len() as u16;
+
+                            cursor_pos.column = current_message.message_line_len() as u16;
                         }
 
                         '^' if matches!(edit_mode, Mode::Normal) => {
@@ -498,12 +594,11 @@ fn main() {
 
                         c if matches!(edit_mode, Mode::Y) => {
                             if c == 'y' {
-                                let Some(current_line) = current_line else {
-                                    edit_mode = Mode::Normal;
-                                    continue;
+                                if let Some(current_message) =
+                                    chat_messages.get(current_message_index)
+                                {
+                                    clipboard.set_text(&current_message.message).unwrap();
                                 };
-
-                                clipboard.set_text(&current_line.message).unwrap();
                             }
 
                             edit_mode = Mode::Normal;
@@ -571,14 +666,7 @@ fn draw(
         .saturating_sub(1);
     stdout.queue(cursor::MoveTo(0, first_message_pos))?;
     for (i, message) in chat_messages[messages_start..].iter().enumerate() {
-        stdout.queue(style::Print(format!(
-            "{}: {}",
-            message
-                .tags
-                .get("display-name")
-                .unwrap_or(message.prefix.nick.as_ref().unwrap_or(&message.channel)),
-            message.message
-        )))?;
+        stdout.queue(style::Print(message.message_line()))?;
         stdout.queue(cursor::MoveTo(0, first_message_pos + i as u16 + 1))?;
     }
 
@@ -617,7 +705,7 @@ mod tests {
     fn test_prefix_parsing() {
         let message = "@badge-info=;badges=moderator/1;color=;display-name=bar;emote-sets=0,300374282;mod=1;subscriber=0;user-type=mod :tmi.twitch.tv USERSTATE #foo";
         let mut pos = 0;
-        let tags = Tags::parse(message, &mut pos).unwrap();
+        let _ = Tags::parse(message, &mut pos).unwrap();
         let prefix = Prefix::parse(message, &mut pos).unwrap();
 
         eprintln!("{prefix:?}");
@@ -629,7 +717,7 @@ mod tests {
     fn test_prefix_parsing_with_nick_and_user() {
         let message = "@badge-info=;badges=broadcaster/1;client-nonce=28e05b1c83f1e916ca1710c44b014515;color=#0000FF;display-name=foofoo;emotes=62835:0-10;first-msg=0;flags=;id=f80a19d6-e35a-4273-82d0-cd87f614e767;mod=0;room-id=713936733;subscriber=0;tmi-sent-ts=1642696567751;turbo=0;user-id=713936733;user-type= :foofoo!foofoo@foofoo.tmi.twitch.tv PRIVMSG #bar :bleedPurple";
         let mut pos = 0;
-        let tags = Tags::parse(message, &mut pos).unwrap();
+        let _ = Tags::parse(message, &mut pos).unwrap();
         let prefix = Prefix::parse(message, &mut pos).unwrap();
 
         eprintln!("{prefix:?}");
@@ -641,8 +729,8 @@ mod tests {
     fn test_command_parsing() {
         let message = "@badge-info=;badges=broadcaster/1;client-nonce=28e05b1c83f1e916ca1710c44b014515;color=#0000FF;display-name=foofoo;emotes=62835:0-10;first-msg=0;flags=;id=f80a19d6-e35a-4273-82d0-cd87f614e767;mod=0;room-id=713936733;subscriber=0;tmi-sent-ts=1642696567751;turbo=0;user-id=713936733;user-type= :foofoo!foofoo@foofoo.tmi.twitch.tv PRIVMSG #bar :bleedPurple";
         let mut pos = 0;
-        let tags = Tags::parse(message, &mut pos).unwrap();
-        let prefix = Prefix::parse(message, &mut pos).unwrap();
+        let _ = Tags::parse(message, &mut pos).unwrap();
+        let _ = Prefix::parse(message, &mut pos).unwrap();
         let command = IRCCommand::parse(message, &mut pos).unwrap();
 
         eprintln!("{command:?}");
